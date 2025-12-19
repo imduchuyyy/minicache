@@ -1,12 +1,10 @@
-mod cache;
-
-use cache::Cache;
 use axum::{
     extract::{Path, State},
     routing::get,
     Router,
     body::Bytes,
 };
+use minicache::Cache;
 use std::sync::{Arc, Mutex};
 use std::env;
 
