@@ -1,8 +1,8 @@
 <div align="center">
 Your production-ready caching server with under 100 lines of code.
-</div>
 
 LRU Cache | HTTP Server | Configurable Capacity
+</div>
 
 ## How to use
 1. Run the server:
