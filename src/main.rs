@@ -38,11 +38,13 @@ async fn main() {
 async fn handle_get(
     Path(key): Path<String>,
     State(cache): State<SharedCache>,
-) -> String {
+) -> Bytes {
+    let key = Bytes::from(key);
+
     let mut cache = cache.lock().unwrap();
-    match cache.get(&key.into_bytes()) {
-        Some(value) => String::from_utf8_lossy(&value).to_string(),
-        None => "Key not found".to_string(),
+    match cache.get(&key) {
+        Some(value) => value,
+        None => Bytes::new(), // Return empty body if not found
     }
 }
 
@@ -50,9 +52,12 @@ async fn handle_get(
 async fn handle_put(
     Path(key): Path<String>,
     State(cache): State<SharedCache>,
-    body: Bytes, // Extracts the raw body (-d)
+    body: Bytes,
 ) -> &'static str {
+    let key = Bytes::from(key); // unavoidable (URL path)
+
     let mut cache = cache.lock().unwrap();
-    cache.push(key.into_bytes(), body.to_vec());
+    cache.put(key, body); // ZERO COPY
+
     "OK"
 }

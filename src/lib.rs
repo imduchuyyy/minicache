@@ -1,137 +1,143 @@
 use std::collections::HashMap;
+use bytes::Bytes;
 use std::fmt::Display;
 use std::sync::{Arc, Mutex, Weak};
 
-type Link = Option<Arc<Mutex<Node>>>;
-type WeakLink = Option<Weak<Mutex<Node>>>;
+type Key = Bytes;
+type Value = Bytes;
+type Index = usize;
 
 #[derive(Debug)]
-struct Node {
-    key: Vec<u8>, // Stored to allow removal from HashMap during eviction
-    value: Vec<u8>,
-    prev: WeakLink, // use Weak to avoid reference cycles (memory leaks)
-    next: Link,
+struct Entry {
+    key: Key,
+    value: Value,
+    prev: Option<Index>,
+    next: Option<Index>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Cache {
     capacity: usize,
-    head: Link,
-    tail: Link,
-    map: HashMap<Vec<u8>, Arc<Mutex<Node>>>,
+    map: HashMap<Key, Index>,
+    entries: Vec<Entry>,
+    head: Option<Index>,
+    tail: Option<Index>,
+    free: Vec<Index>, // reuse slot
+
 }
 
 impl Cache {
     pub fn new(capacity: usize) -> Self {
         Cache {
             capacity,
+            map: HashMap::with_capacity(capacity),
+            entries: Vec::with_capacity(capacity),
             head: None,
             tail: None,
-            map: HashMap::new(),
+            free: Vec::new(),
         }
     }
 
-    pub fn get(&mut self, key: &Vec<u8>) -> Option<Vec<u8>> {
-        // Clone the Rc to drop the map borrow immediately
-        let node = self.map.get(key)?.clone();
-
-        // Move to front because it was recently used
-        self.detach_node(node.clone());
-        self.attach_to_head(node.clone());
-
-        let val = node.lock().unwrap().value.clone();
-        Some(val)
+    pub fn get(&mut self, key: &Key) -> Option<Value> {
+        let idx = *self.map.get(key)?;
+        self.move_to_head(idx);
+        Some(self.entries[idx].value.clone()) // O(1)
     }
 
-    pub fn push(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        if let Some(node) = self.map.get(&key).cloned() {
-            // Update existing
-            node.lock().unwrap().value = value;
-            self.detach_node(node.clone());
-            self.attach_to_head(node);
+    pub fn put(&mut self, key: Key, value: Value) {
+        if let Some(&idx) = self.map.get(&key) {
+            self.entries[idx].value = value;
+            self.move_to_head(idx);
+            return;
+        }
+
+
+        if self.map.len() == self.capacity {
+            self.evict();
+        }
+
+        let idx = self.alloc(Entry {
+            key: key.clone(),
+            value,
+            prev: None,
+            next: None,
+        });
+
+        self.map.insert(key, idx);
+        self.attach_head(idx);
+    }
+
+    fn move_to_head(&mut self, idx: Index) {
+        self.detach(idx);
+        self.attach_head(idx);
+    }
+
+    fn attach_head(&mut self, idx: Index) {
+        self.entries[idx].prev = None;
+        self.entries[idx].next = self.head;
+
+        if let Some(old_head) = self.head {
+            self.entries[old_head].prev = Some(idx);
         } else {
-            // Check capacity
-            if self.map.len() >= self.capacity {
-                self.evict();
-            }
-
-            // Create new
-            let new_node = Arc::new(Mutex::new(Node {
-                key: key.clone(),
-                value,
-                prev: None,
-                next: None,
-            }));
-
-            self.map.insert(key, new_node.clone());
-            self.attach_to_head(new_node);
+            self.tail = Some(idx);
         }
+
+        self.head = Some(idx);
     }
 
-    // --- Helper Methods ---
-
-    fn detach_node(&mut self, node: Arc<Mutex<Node>>) {
-        let (prev_weak, next_rc) = {
-            let mut n = node.lock().unwrap();
-            (n.prev.take(), n.next.take())
+    fn detach(&mut self, idx: Index) {
+        let (prev, next) = {
+            let entry = &self.entries[idx];
+            (entry.prev, entry.next)
         };
 
-        // Fix the 'next' pointer of the previous node
-        if let Some(ref p_weak) = prev_weak {
-            if let Some(p_arc) = p_weak.upgrade() {
-                p_arc.lock().unwrap().next = next_rc.clone();
-            }
+        if let Some(prev_idx) = prev {
+            self.entries[prev_idx].next = next;
         } else {
-            self.head = next_rc.clone();
+            self.head = next;
         }
 
-        // Fix the 'prev' pointer of the next node
-        if let Some(ref n_arc) = next_rc {
-            n_arc.lock().unwrap().prev = prev_weak.clone();
+        if let Some(next_idx) = next {
+            self.entries[next_idx].prev = prev;
         } else {
-            self.tail = prev_weak.and_then(|w| w.upgrade());
+            self.tail = prev;
         }
+
+        self.entries[idx].prev = None;
+        self.entries[idx].next = None;
     }
 
-    fn attach_to_head(&mut self, node: Arc<Mutex<Node>>) {
-        let mut n = node.lock().unwrap();
-        n.next = self.head.clone();
-        n.prev = None;
-
-        if let Some(ref old_head) = self.head {
-            old_head.lock().unwrap().prev = Some(Arc::downgrade(&node));
+    fn alloc(&mut self, entry: Entry) -> Index {
+        if let Some(idx) = self.free.pop() {
+            self.entries[idx] = entry;
+            idx
         } else {
-            self.tail = Some(node.clone());
+            let idx = self.entries.len();
+            self.entries.push(entry);
+            idx
         }
-        drop(n); // Explicitly drop lock before modifying self.head
-
-        self.head = Some(node);
     }
 
     fn evict(&mut self) {
-        if let Some(old_tail) = self.tail.clone() {
-            self.detach_node(old_tail.clone());
-            let key = &old_tail.lock().unwrap().key;
-            self.map.remove(key);
+        if let Some(tail_idx) = self.tail {
+            let key = self.entries[tail_idx].key.clone();
+            self.detach(tail_idx);
+            self.map.remove(&key);
+            self.free.push(tail_idx);
         }
     }
 }
 
 impl Display for Cache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut node_opt = self.head.clone();
-        let mut first = true;
-        writeln!(f, "Cache [")?;
-        while let Some(node_rc) = node_opt {
-            if !first {
-                writeln!(f, " <-> ")?;
-            }
-            let node = node_rc.lock().unwrap();
-            writeln!(f, "({:?}: {:?})", node.key, node.value)?;
-            node_opt = node.next.clone();
-            first = false;
+        let mut idx = self.head;
+        write!(f, "Cache [")?;
+        while let Some(i) = idx {
+            let entry = &self.entries[i];
+            write!(f, "({:?}: {:?}) ", entry.key, entry.value)?;
+            idx = entry.next;
         }
-        writeln!(f, "]")
+        write!(f, "]")
     }
 }
 
