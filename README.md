@@ -1,7 +1,7 @@
-# minicache
 
 <div align="center">
 
+# minicache
 ![Build Status](https://img.shields.io/github/actions/workflow/status/imduchuyyy/minicache/rust.yml?branch=main)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Crates.io](https://img.shields.io/crates/v/minicache.svg)
