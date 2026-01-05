@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::{Arc, Mutex, Weak};
 
 type Key = Bytes;
 type Value = Bytes;
-type Index = usize;
+type Index = u32;
 
 #[derive(Debug)]
 struct Entry {
@@ -23,11 +22,14 @@ pub struct Cache {
     head: Option<Index>,
     tail: Option<Index>,
     free: Vec<Index>, // reuse slot
-
 }
 
 impl Cache {
     pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity <= u32::MAX as usize,
+            "Capacity too large for u32 index"
+        );
         Cache {
             capacity,
             map: HashMap::with_capacity(capacity),
@@ -41,16 +43,15 @@ impl Cache {
     pub fn get(&mut self, key: &Key) -> Option<Value> {
         let idx = *self.map.get(key)?;
         self.move_to_head(idx);
-        Some(self.entries[idx].value.clone()) // O(1)
+        Some(self.entries[idx as usize].value.clone()) // O(1)
     }
 
     pub fn put(&mut self, key: Key, value: Value) {
         if let Some(&idx) = self.map.get(&key) {
-            self.entries[idx].value = value;
+            self.entries[idx as usize].value = value;
             self.move_to_head(idx);
             return;
         }
-
 
         if self.map.len() == self.capacity {
             self.evict();
@@ -73,11 +74,11 @@ impl Cache {
     }
 
     fn attach_head(&mut self, idx: Index) {
-        self.entries[idx].prev = None;
-        self.entries[idx].next = self.head;
+        self.entries[idx as usize].prev = None;
+        self.entries[idx as usize].next = self.head;
 
         if let Some(old_head) = self.head {
-            self.entries[old_head].prev = Some(idx);
+            self.entries[old_head as usize].prev = Some(idx);
         } else {
             self.tail = Some(idx);
         }
@@ -87,40 +88,40 @@ impl Cache {
 
     fn detach(&mut self, idx: Index) {
         let (prev, next) = {
-            let entry = &self.entries[idx];
+            let entry = &self.entries[idx as usize];
             (entry.prev, entry.next)
         };
 
         if let Some(prev_idx) = prev {
-            self.entries[prev_idx].next = next;
+            self.entries[prev_idx as usize].next = next;
         } else {
             self.head = next;
         }
 
         if let Some(next_idx) = next {
-            self.entries[next_idx].prev = prev;
+            self.entries[next_idx as usize].prev = prev;
         } else {
             self.tail = prev;
         }
 
-        self.entries[idx].prev = None;
-        self.entries[idx].next = None;
+        self.entries[idx as usize].prev = None;
+        self.entries[idx as usize].next = None;
     }
 
     fn alloc(&mut self, entry: Entry) -> Index {
         if let Some(idx) = self.free.pop() {
-            self.entries[idx] = entry;
+            self.entries[idx as usize] = entry;
             idx
         } else {
             let idx = self.entries.len();
             self.entries.push(entry);
-            idx
+            idx as Index
         }
     }
 
     fn evict(&mut self) {
         if let Some(tail_idx) = self.tail {
-            let key = self.entries[tail_idx].key.clone();
+            let key = self.entries[tail_idx as usize].key.clone();
             self.detach(tail_idx);
             self.map.remove(&key);
             self.free.push(tail_idx);
@@ -133,7 +134,7 @@ impl Display for Cache {
         let mut idx = self.head;
         write!(f, "Cache [")?;
         while let Some(i) = idx {
-            let entry = &self.entries[i];
+            let entry = &self.entries[i as usize];
             write!(f, "({:?}: {:?}) ", entry.key, entry.value)?;
             idx = entry.next;
         }
@@ -144,23 +145,81 @@ impl Display for Cache {
 #[cfg(test)]
 mod tests {
     use super::Cache;
+    use bytes::Bytes;
 
-    #[tokio::test]
-    async fn test_cache_basic() {
+    #[test]
+    fn test_cache_basic() {
         let mut cache = Cache::new(2);
-        cache.push(vec![1], vec![10]);
-        cache.push(vec![2], vec![20]);
+        cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
+        cache.put(Bytes::from(vec![2]), Bytes::from(vec![20]));
+
+        assert_eq!(
+            cache.get(&Bytes::from(vec![1])),
+            Some(Bytes::from(vec![10]))
+        );
+        assert_eq!(
+            cache.get(&Bytes::from(vec![2])),
+            Some(Bytes::from(vec![20]))
+        );
+        assert!(cache.get(&Bytes::from(vec![3])).is_none());
     }
 
-    #[tokio::test]
-    async fn test_cache_eviction() {
+    #[test]
+    fn test_cache_eviction() {
         let mut cache = Cache::new(2);
-        cache.push(vec![1], vec![10]);
-        cache.push(vec![2], vec![20]);
-        cache.push(vec![3], vec![30]); // This should evict key [1]
+        cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
+        cache.put(Bytes::from(vec![2]), Bytes::from(vec![20]));
+        // Access 1 to make it MRU
+        cache.get(&Bytes::from(vec![1]));
 
-        assert!(cache.get(&vec![1]).is_none());
-        assert_eq!(cache.get(&vec![2]), Some(vec![20]));
-        assert_eq!(cache.get(&vec![3]), Some(vec![30]));
+        // Add 3, should evict 2 (since 1 was just accessed)
+        cache.put(Bytes::from(vec![3]), Bytes::from(vec![30]));
+
+        assert_eq!(
+            cache.get(&Bytes::from(vec![1])),
+            Some(Bytes::from(vec![10]))
+        );
+        assert!(cache.get(&Bytes::from(vec![2])).is_none());
+        assert_eq!(
+            cache.get(&Bytes::from(vec![3])),
+            Some(Bytes::from(vec![30]))
+        );
+    }
+
+    #[test]
+    fn test_cache_update() {
+        let mut cache = Cache::new(2);
+        cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
+        cache.put(Bytes::from(vec![1]), Bytes::from(vec![11]));
+
+        assert_eq!(
+            cache.get(&Bytes::from(vec![1])),
+            Some(Bytes::from(vec![11]))
+        );
+    }
+
+    #[test]
+    fn test_alloc_handling() {
+        let mut cache = Cache::new(2);
+        cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
+        cache.put(Bytes::from(vec![2]), Bytes::from(vec![20]));
+        cache.put(Bytes::from(vec![3]), Bytes::from(vec![30])); // evicts 1
+
+        // Internal check: cache.free should be empty after reuse, but let's just check behavior
+        assert_eq!(
+            cache.get(&Bytes::from(vec![2])),
+            Some(Bytes::from(vec![20]))
+        );
+        assert_eq!(
+            cache.get(&Bytes::from(vec![3])),
+            Some(Bytes::from(vec![30]))
+        );
+
+        cache.put(Bytes::from(vec![4]), Bytes::from(vec![40])); // evicts 2
+        assert!(cache.get(&Bytes::from(vec![2])).is_none());
+        assert_eq!(
+            cache.get(&Bytes::from(vec![4])),
+            Some(Bytes::from(vec![40]))
+        );
     }
 }
