@@ -1,6 +1,12 @@
 [package]
 name = "minicache"
 version = "0.1.0"
+description = "A minimalistic in-memory cache with async support"
+homepage = "github.com/imduchuyyy/minicache"
+respository = "github.com/imduchuyyy/minicache"
+readme = "README.md"
+keywords = ["cache", "in-memory", "async", "rust"]
+categories = ["asynchronous", "data-structures", "performance"]
 edition = "2024"
 
 [dependencies]
