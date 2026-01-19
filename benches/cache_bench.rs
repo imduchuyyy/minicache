@@ -1,9 +1,9 @@
 use bytes::Bytes;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use minicache::Cache;
+use minicache::LruCache;
 
 fn bench_cache_put(c: &mut Criterion) {
-    let mut cache = Cache::new(1000);
+    let mut cache = LruCache::new(1000);
     let key = Bytes::from_static(b"key");
     let val = Bytes::from_static(b"value");
 
@@ -13,7 +13,7 @@ fn bench_cache_put(c: &mut Criterion) {
 }
 
 fn bench_cache_fill_evict(c: &mut Criterion) {
-    let mut cache = Cache::new(100);
+    let mut cache = LruCache::new(100);
     let val = Bytes::from_static(b"value");
 
     c.bench_function("cache_fill_evict", |b| {

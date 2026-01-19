@@ -1,6 +1,9 @@
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::fmt::Display;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::Mutex;
 
 type Key = Bytes;
 type Value = Bytes;
@@ -15,7 +18,7 @@ struct Entry {
 }
 
 #[derive(Debug)]
-pub struct Cache {
+pub struct LruCache {
     capacity: usize,
     map: HashMap<Key, Index>,
     entries: Vec<Entry>,
@@ -24,13 +27,13 @@ pub struct Cache {
     free: Vec<Index>, // reuse slot
 }
 
-impl Cache {
+impl LruCache {
     pub fn new(capacity: usize) -> Self {
         assert!(
             capacity <= u32::MAX as usize,
             "Capacity too large for u32 index"
         );
-        Cache {
+        LruCache {
             capacity,
             map: HashMap::with_capacity(capacity),
             entries: Vec::with_capacity(capacity),
@@ -129,10 +132,10 @@ impl Cache {
     }
 }
 
-impl Display for Cache {
+impl Display for LruCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut idx = self.head;
-        write!(f, "Cache [")?;
+        write!(f, "LruCache [")?;
         while let Some(i) = idx {
             let entry = &self.entries[i as usize];
             write!(f, "({:?}: {:?}) ", entry.key, entry.value)?;
@@ -142,14 +145,55 @@ impl Display for Cache {
     }
 }
 
+#[derive(Debug)]
+pub struct ShardedCache {
+    segments: Vec<Mutex<LruCache>>,
+    hasher: RandomState,
+    num_shards: usize,
+}
+
+impl ShardedCache {
+    pub fn new(total_capacity: usize, num_shards: usize) -> Self {
+        assert!(num_shards > 0, "num_shards must be > 0");
+        let seg_capacity = (total_capacity + num_shards - 1) / num_shards;
+        let mut segments = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            segments.push(Mutex::new(LruCache::new(seg_capacity)));
+        }
+        ShardedCache {
+            segments,
+            hasher: RandomState::new(),
+            num_shards,
+        }
+    }
+
+    pub fn get(&self, key: &Key) -> Option<Value> {
+        let idx = self.get_shard_index(key);
+        let mut shard = self.segments[idx].lock().unwrap();
+        shard.get(key)
+    }
+
+    pub fn put(&self, key: Key, value: Value) {
+        let idx = self.get_shard_index(&key);
+        let mut shard = self.segments[idx].lock().unwrap();
+        shard.put(key, value)
+    }
+
+    fn get_shard_index(&self, key: &Key) -> usize {
+        let mut s = self.hasher.build_hasher();
+        key.hash(&mut s);
+        (s.finish() as usize) % self.num_shards
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Cache;
+    use super::LruCache;
     use bytes::Bytes;
 
     #[test]
     fn test_cache_basic() {
-        let mut cache = Cache::new(2);
+        let mut cache = LruCache::new(2);
         cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
         cache.put(Bytes::from(vec![2]), Bytes::from(vec![20]));
 
@@ -166,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_cache_eviction() {
-        let mut cache = Cache::new(2);
+        let mut cache = LruCache::new(2);
         cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
         cache.put(Bytes::from(vec![2]), Bytes::from(vec![20]));
         // Access 1 to make it MRU
@@ -188,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_cache_update() {
-        let mut cache = Cache::new(2);
+        let mut cache = LruCache::new(2);
         cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
         cache.put(Bytes::from(vec![1]), Bytes::from(vec![11]));
 
@@ -200,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_alloc_handling() {
-        let mut cache = Cache::new(2);
+        let mut cache = LruCache::new(2);
         cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
         cache.put(Bytes::from(vec![2]), Bytes::from(vec![20]));
         cache.put(Bytes::from(vec![3]), Bytes::from(vec![30])); // evicts 1
@@ -220,6 +264,23 @@ mod tests {
         assert_eq!(
             cache.get(&Bytes::from(vec![4])),
             Some(Bytes::from(vec![40]))
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_basic() {
+        use super::ShardedCache;
+        let cache = ShardedCache::new(10, 2); // 10 capacity, 2 shards
+        cache.put(Bytes::from(vec![1]), Bytes::from(vec![10]));
+        cache.put(Bytes::from(vec![2]), Bytes::from(vec![20]));
+
+        assert_eq!(
+            cache.get(&Bytes::from(vec![1])),
+            Some(Bytes::from(vec![10]))
+        );
+        assert_eq!(
+            cache.get(&Bytes::from(vec![2])),
+            Some(Bytes::from(vec![20]))
         );
     }
 }

@@ -4,12 +4,12 @@ use axum::{
     Router,
     body::Bytes,
 };
-use minicache::Cache;
-use std::sync::{Arc, Mutex};
+use minicache::ShardedCache;
+use std::sync::Arc;
 use std::env;
 
-// Assume ConcurrentCache is the struct we built previously
-type SharedCache = Arc<Mutex<Cache>>;
+// ShardedCache handles locking internally
+type SharedCache = Arc<ShardedCache>;
 
 #[tokio::main]
 async fn main() {
@@ -20,7 +20,9 @@ async fn main() {
 
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("127.0.0.1:{}", port);
-    let shared_cache = Arc::new(Mutex::new(Cache::new(capacity)));
+    
+    // Create sharded cache with 16 segments
+    let shared_cache = Arc::new(ShardedCache::new(capacity, 16));
 
     // Both GET and PUT use the same path pattern
     let app = Router::new()
@@ -41,7 +43,6 @@ async fn handle_get(
 ) -> Bytes {
     let key = Bytes::from(key);
 
-    let mut cache = cache.lock().unwrap();
     match cache.get(&key) {
         Some(value) => value,
         None => Bytes::new(), // Return empty body if not found
@@ -55,9 +56,6 @@ async fn handle_put(
     body: Bytes,
 ) -> &'static str {
     let key = Bytes::from(key); // unavoidable (URL path)
-
-    let mut cache = cache.lock().unwrap();
-    cache.put(key, body); // ZERO COPY
-
+    cache.put(key, body);
     "OK"
 }
