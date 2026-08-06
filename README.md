@@ -2,7 +2,7 @@
 <div align="center">
 
 # shmcache
-![Build Status](https://img.shields.io/github/actions/workflow/status/imduchuyyy/minicache/rust.yml?branch=main)
+![Build Status](https://img.shields.io/github/actions/workflow/status/imduchuyyy/shmcache/rust.yml?branch=main)
 ![License](https://img.shields.io/badge/license-GPL-blue.svg)
 
 **A shared-memory cache library in Rust.**

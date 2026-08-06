@@ -2,8 +2,8 @@
 name = "shmcache"
 version = "0.1.0"
 description = "A lock-free cache in POSIX shared memory, shared across processes with no daemon"
-homepage = "https://github.com/imduchuyyy/minicache"
-repository = "https://github.com/imduchuyyy/minicache"
+homepage = "https://github.com/imduchuyyy/shmcache"
+repository = "https://github.com/imduchuyyy/shmcache"
 readme = "README.md"
 keywords = ["cache", "shared-memory", "mmap", "ipc", "lock-free"]
 categories = ["caching", "data-structures", "concurrency"]
