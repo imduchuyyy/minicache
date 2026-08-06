@@ -21,3 +21,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "cache_bench"
 harness = false
+
+# Cargo only auto-discovers `examples/`, so the singular directory needs a path.
+[[example]]
+name = "hello"
+path = "example/main.rs"
