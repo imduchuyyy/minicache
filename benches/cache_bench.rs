@@ -1,5 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use minicache::ShmCache;
+use shmcache::ShmCache;
 
 const SLOTS: usize = 4096;
 

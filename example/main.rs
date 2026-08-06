@@ -1,8 +1,8 @@
-use minicache::ShmCache;
+use shmcache::ShmCache;
 
-const APP: &str = "minicache-demo";
+const APP: &str = "shmcache-demo";
 
-fn main() -> Result<(), minicache::Error> {
+fn main() -> Result<(), shmcache::Error> {
     let cache = ShmCache::open(APP, 256)?;
     println!("opened {APP:?} with {} slots", cache.capacity());
 

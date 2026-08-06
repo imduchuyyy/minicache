@@ -1,6 +1,6 @@
 # Architecture
 
-Technical reference for `minicache`. The README covers usage; this covers how it works and why it is built this way.
+Technical reference for `shmcache`. The README covers usage; this covers how it works and why it is built this way.
 
 ---
 

@@ -1,7 +1,7 @@
 
 <div align="center">
 
-# minicache
+# shmcache
 ![Build Status](https://img.shields.io/github/actions/workflow/status/imduchuyyy/minicache/rust.yml?branch=main)
 ![License](https://img.shields.io/badge/license-GPL-blue.svg)
 
@@ -9,7 +9,7 @@
 
 </div>
 
-`minicache` is a library you embed directly in your application. Several processes on the same host name the same cache and share it — there is no server to run and no network hop.
+`shmcache` is a library you embed directly in your application. Several processes on the same host name the same cache and share it — there is no server to run and no network hop.
 
 ## Features
 
@@ -24,7 +24,7 @@
 You give the cache a name, not a path. Every process that uses the same name shares one cache, and whichever opens it first creates it.
 
 ```rust
-use minicache::ShmCache;
+use shmcache::ShmCache;
 
 let cache = ShmCache::open("myapp", 256)?; // app name, slot count
 
@@ -32,7 +32,7 @@ cache.write(b"mykey", b"myvalue")?;
 assert_eq!(cache.read(b"mykey").as_deref(), Some(&b"myvalue"[..]));
 
 ShmCache::unlink("myapp")?; // destroy it; otherwise it lives until reboot
-# Ok::<(), minicache::Error>(())
+# Ok::<(), shmcache::Error>(())
 ```
 
 The name must be at most 30 bytes of alphanumerics, `-`, `_`, or `.` — that is what macOS accepts for a shared-memory object.

@@ -1,6 +1,6 @@
 #![cfg(feature = "_selftest")]
 
-use minicache::ShmCache;
+use shmcache::ShmCache;
 use std::process::{Child, Command};
 
 const WORKER: &str = env!("CARGO_BIN_EXE_shm_worker");

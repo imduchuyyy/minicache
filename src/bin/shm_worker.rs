@@ -1,5 +1,5 @@
-use minicache::ShmCache;
-use minicache::selftest::{check_value, make_value};
+use shmcache::ShmCache;
+use shmcache::selftest::{check_value, make_value};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 

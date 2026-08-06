@@ -1,5 +1,5 @@
 [package]
-name = "minicache"
+name = "shmcache"
 version = "0.1.0"
 description = "A lock-free cache in POSIX shared memory, shared across processes with no daemon"
 homepage = "https://github.com/imduchuyyy/minicache"

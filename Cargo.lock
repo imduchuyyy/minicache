@@ -253,16 +253,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minicache"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "criterion",
- "libc",
- "memmap2",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -440,6 +430,16 @@ dependencies = [
  "ryu",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "shmcache"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "criterion",
+ "libc",
+ "memmap2",
 ]
 
 [[package]]

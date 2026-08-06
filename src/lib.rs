@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 #[cfg(not(unix))]
-compile_error!("minicache requires a Unix platform: it is built on POSIX shared memory");
+compile_error!("shmcache requires a Unix platform: it is built on POSIX shared memory");
 
 use bytes::Bytes;
 use memmap2::MmapMut;
@@ -77,7 +77,7 @@ impl std::fmt::Display for Error {
             Error::ValueTooLong { len } => {
                 write!(f, "value of {len} bytes exceeds limit of {MAX_VAL_LEN}")
             }
-            Error::BadFormat => write!(f, "object is not a minicache shared-memory cache"),
+            Error::BadFormat => write!(f, "object is not a shmcache shared-memory cache"),
             Error::InvalidAppName { reason } => write!(f, "invalid app name: {reason}"),
             Error::SlotStalled => write!(f, "slot is locked by a writer that never finished"),
         }
