@@ -2,18 +2,29 @@
 // sync with the API.
 #![doc = include_str!("../README.md")]
 
+#[cfg(not(unix))]
+compile_error!("minicache requires a Unix platform: it is built on POSIX shared memory");
+
 use bytes::Bytes;
 use memmap2::MmapMut;
-use std::fs::OpenOptions;
+use std::ffi::CString;
+use std::fs::File;
 use std::hint;
 use std::io;
-use std::path::Path;
+use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::time::{Duration, Instant};
 
-/// "MINICACH", so we refuse to map a file that is not ours.
+/// "MINICACH", so we refuse to map an object that is not ours.
 const MAGIC: u64 = 0x4d49_4e49_4341_4348;
 const FORMAT_VERSION: u32 = 1;
+
+/// Longest app name accepted.
+///
+/// macOS caps a POSIX shared-memory name at 31 bytes including the leading slash, and
+/// silently rejects anything longer. Linux allows far more, but the limit is applied
+/// uniformly so a name that works on one platform works on the other.
+pub const MAX_APP_NAME_LEN: usize = 30;
 
 /// Largest key we will store. Keys are inline in the slot, not indirected.
 pub const MAX_KEY_LEN: usize = 64;
@@ -77,10 +88,13 @@ pub enum Error {
     Io(io::Error),
     KeyTooLong { len: usize },
     ValueTooLong { len: usize },
-    /// The file exists but was not written by this format/version.
+    /// The object exists but was not written by this format/version.
     BadFormat,
-    /// A slot stayed write-locked for `SPIN_LIMIT` iterations, which in practice
-    /// means the process that locked it died before unlocking.
+    /// The app name is empty, too long, or contains something other than an
+    /// alphanumeric, `-`, `_`, or `.`.
+    InvalidAppName { reason: &'static str },
+    /// A slot stayed write-locked for `WRITE_LOCK_TIMEOUT`, which in practice means
+    /// the process that locked it died before unlocking.
     SlotStalled,
 }
 
@@ -94,7 +108,8 @@ impl std::fmt::Display for Error {
             Error::ValueTooLong { len } => {
                 write!(f, "value of {len} bytes exceeds limit of {MAX_VAL_LEN}")
             }
-            Error::BadFormat => write!(f, "file is not a minicache shared-memory cache"),
+            Error::BadFormat => write!(f, "object is not a minicache shared-memory cache"),
+            Error::InvalidAppName { reason } => write!(f, "invalid app name: {reason}"),
             Error::SlotStalled => write!(f, "slot is locked by a writer that never finished"),
         }
     }
@@ -122,7 +137,7 @@ struct Header {
 /// `seq` even means stable, odd means a writer holds the slot.
 ///
 /// A zeroed slot is naturally valid: `seq == 0` (even, unlocked) and `key_len == 0`,
-/// which matches no key, so a freshly created file reads as empty.
+/// which matches no key, so a freshly created object reads as empty.
 #[repr(C, align(64))]
 struct Slot {
     seq: AtomicU64,
@@ -132,16 +147,16 @@ struct Slot {
     val: [u8; MAX_VAL_LEN],
 }
 
-/// A cache that lives in a memory-mapped file, so several processes on the same host
+/// A cache that lives in POSIX shared memory, so several processes on the same host
 /// share one cache with no server and no network hop.
 ///
-/// A handle is obtained with [`ShmCache::open`]; any process opening the same path
+/// A handle is obtained with [`ShmCache::open`]; any process opening the same name
 /// attaches to the same cache, and whichever gets there first creates it.
 ///
 /// # Layout
 ///
 /// Everything inside the mapping is `#[repr(C)]` with a fixed layout. Nothing in there
-/// may be a pointer: each process maps the file at a different address, so a pointer
+/// may be a pointer: each process maps the object at a different address, so a pointer
 /// written by one process is meaningless to another. This is why the cache cannot be
 /// built on `HashMap`/`Vec`, whose contents are process-local heap.
 ///
@@ -181,57 +196,83 @@ unsafe impl Send for ShmCache {}
 unsafe impl Sync for ShmCache {}
 
 impl ShmCache {
-    /// Open the cache at `path`, creating and initialising it if it does not exist.
+    /// Open the cache named `app_name`, creating it if it does not exist.
     ///
-    /// `num_slots` is only honoured by whichever process creates the file. An existing
+    /// Every process that passes the same name shares one cache. The name is not a
+    /// filesystem path: it identifies a POSIX shared-memory object, which lives in RAM
+    /// and never reaches disk. On Linux that surfaces as a file under `/dev/shm`, which
+    /// is tmpfs; on macOS it has no filesystem presence at all. Either way the cache
+    /// disappears on reboot, and nothing is ever written to durable storage.
+    ///
+    /// The name must be at most [`MAX_APP_NAME_LEN`] bytes of alphanumerics, `-`, `_`,
+    /// or `.` — the limit and the character set are what macOS accepts.
+    ///
+    /// `num_slots` is only honoured by whichever process creates the cache. An existing
     /// cache keeps the slot count it was created with, and the caller's value is
     /// ignored — reinterpreting someone else's slots at a different modulus would mean
     /// the two processes hash the same key to different places and silently stop
     /// sharing. Use [`ShmCache::capacity`] to see what you actually got.
-    pub fn open<P: AsRef<Path>>(path: P, num_slots: usize) -> Result<Self, Error> {
+    pub fn open(app_name: &str, num_slots: usize) -> Result<Self, Error> {
         assert!(num_slots > 0, "num_slots must be > 0");
         assert!(
             num_slots <= u32::MAX as usize,
             "num_slots must fit in a u32"
         );
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let name = shm_name(app_name)?;
+        let (object, created) = open_shm_object(&name)?;
 
-        // Only ever grow. `set_len` to a smaller size would truncate a cache another
-        // process is actively using.
-        if file.metadata()?.len() < Self::file_len(num_slots) as u64 {
-            file.set_len(Self::file_len(num_slots) as u64)?;
+        if created {
+            // macOS permits exactly one ftruncate on a shared-memory object, and only
+            // before it is mapped, so this is the single chance to size it. Winning the
+            // O_EXCL create is what guarantees no other process has mapped it yet.
+            object.set_len(Self::file_len(num_slots) as u64)?;
+        } else {
+            // The creator may not have sized the object yet. It is visible from
+            // `shm_open` the moment it is created, so a joiner can arrive first.
+            let mut backoff = Backoff::new();
+            while (object.metadata()?.len() as usize) < size_of::<Header>() {
+                if !backoff.wait(WRITE_LOCK_TIMEOUT) {
+                    return Err(Error::BadFormat);
+                }
+            }
         }
 
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        let mmap = unsafe { MmapMut::map_mut(&object)? };
         if mmap.len() < size_of::<Header>() {
             return Err(Error::BadFormat);
         }
 
         let effective = Self::init_header(&mmap, num_slots)?;
 
-        // The creator may have asked for more slots than we sized the file for, and two
-        // processes racing to create can interleave their `set_len` calls such that the
-        // file ends up shorter than the winning header claims. Either way the header is
-        // authoritative, so the mapping has to be made to cover it.
-        let required = Self::file_len(effective);
-        if mmap.len() < required {
-            file.set_len(required as u64)?;
-            mmap = unsafe { MmapMut::map_mut(&file)? };
-            if mmap.len() < required {
-                return Err(Error::BadFormat);
-            }
+        // The object cannot be resized now, so a header claiming more slots than the
+        // mapping covers means the creator sized it inconsistently.
+        if mmap.len() < Self::file_len(effective) {
+            return Err(Error::BadFormat);
         }
 
         Ok(ShmCache {
             mmap,
             num_slots: effective,
         })
+    }
+
+    /// Destroy the named cache, so the next [`ShmCache::open`] creates a fresh one.
+    ///
+    /// A POSIX shared-memory object outlives the processes using it and is only
+    /// reclaimed by this call or a reboot. Existing handles keep working on the old
+    /// object until they are dropped; only the name is released immediately.
+    ///
+    /// Removing a cache that does not exist is not an error.
+    pub fn unlink(app_name: &str) -> Result<(), Error> {
+        let name = shm_name(app_name)?;
+        if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(Error::Io(err));
+            }
+        }
+        Ok(())
     }
 
     fn file_len(num_slots: usize) -> usize {
@@ -252,7 +293,7 @@ impl ShmCache {
             .compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => {
-                // The OS already zeroed the file, so the slots need no further work.
+                // The OS already zeroed the object, so the slots need no further work.
                 header.version.store(FORMAT_VERSION, Ordering::Relaxed);
                 header.num_slots.store(num_slots as u32, Ordering::Relaxed);
                 header.ready.store(1, Ordering::Release);
@@ -440,6 +481,62 @@ impl ShmCache {
     }
 }
 
+/// Turns an app name into a POSIX shared-memory name: a leading slash and no others.
+///
+/// The character set is deliberately narrow. A `/` anywhere but the front is rejected
+/// outright by POSIX, and anything exotic risks differing between platforms, so this
+/// only accepts what is portable.
+fn shm_name(app_name: &str) -> Result<CString, Error> {
+    if app_name.is_empty() {
+        return Err(Error::InvalidAppName {
+            reason: "name is empty",
+        });
+    }
+    if app_name.len() > MAX_APP_NAME_LEN {
+        return Err(Error::InvalidAppName {
+            reason: "name is longer than 30 bytes, which macOS rejects",
+        });
+    }
+    if !app_name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Err(Error::InvalidAppName {
+            reason: "name may only contain alphanumerics, '-', '_' and '.'",
+        });
+    }
+
+    CString::new(format!("/{app_name}")).map_err(|_| Error::InvalidAppName {
+        reason: "name contains an interior nul byte",
+    })
+}
+
+/// Opens the shared-memory object, reporting whether this call created it.
+///
+/// The `O_EXCL` attempt is what makes creation unambiguous: exactly one process can win
+/// it, and only that process may size the object.
+fn open_shm_object(name: &CString) -> Result<(File, bool), Error> {
+    const MODE: libc::mode_t = 0o600;
+
+    let created = unsafe {
+        libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, MODE as libc::c_uint)
+    };
+    if created >= 0 {
+        return Ok((unsafe { File::from_raw_fd(created) }, true));
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EEXIST) {
+        return Err(Error::Io(err));
+    }
+
+    let joined = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR, MODE as libc::c_uint) };
+    if joined < 0 {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+    Ok((unsafe { File::from_raw_fd(joined) }, false))
+}
+
 /// FNV-1a.
 ///
 /// This must be deterministic across processes. `RandomState` is seeded per process,
@@ -504,25 +601,37 @@ mod tests {
     use super::selftest::{check_value, make_value};
     use super::*;
 
-    fn temp_path(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("minicache-{tag}-{}-{nanos}.shm", std::process::id()))
+    /// A shared-memory object outlives the process that made it, so every test needs a
+    /// name nothing else will pick and must unlink it afterwards or it lingers until
+    /// reboot. The pid keeps concurrent `cargo test` runs apart, and the counter keeps
+    /// tests within one run apart; both are hex to stay under `MAX_APP_NAME_LEN`.
+    struct TempShm(String);
+
+    impl TempShm {
+        fn new() -> Self {
+            use std::sync::atomic::AtomicU64;
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!("mc-t{:x}-{:x}", std::process::id(), n);
+            let _ = ShmCache::unlink(&name);
+            TempShm(name)
+        }
+
+        fn open(&self, num_slots: usize) -> ShmCache {
+            ShmCache::open(&self.0, num_slots).unwrap()
+        }
     }
 
-    struct TempFile(std::path::PathBuf);
-    impl Drop for TempFile {
+    impl Drop for TempShm {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = ShmCache::unlink(&self.0);
         }
     }
 
     #[test]
     fn write_then_read() {
-        let path = TempFile(temp_path("basic"));
-        let cache = ShmCache::open(&path.0, 64).unwrap();
+        let shm = TempShm::new();
+        let cache = shm.open(64);
 
         cache.write(b"hello", b"world").unwrap();
         assert_eq!(cache.read(b"hello"), Some(Bytes::from_static(b"world")));
@@ -531,8 +640,8 @@ mod tests {
 
     #[test]
     fn overwrite_wins() {
-        let path = TempFile(temp_path("overwrite"));
-        let cache = ShmCache::open(&path.0, 64).unwrap();
+        let shm = TempShm::new();
+        let cache = shm.open(64);
 
         cache.write(b"k", b"first").unwrap();
         cache.write(b"k", b"second").unwrap();
@@ -543,8 +652,8 @@ mod tests {
     fn shorter_value_does_not_leave_a_tail() {
         // val_len shrinks but the old bytes are still in the slot; the read must be
         // bounded by val_len, not by whatever is left over.
-        let path = TempFile(temp_path("shrink"));
-        let cache = ShmCache::open(&path.0, 64).unwrap();
+        let shm = TempShm::new();
+        let cache = shm.open(64);
 
         cache.write(b"k", b"aaaaaaaaaaaaaaaa").unwrap();
         cache.write(b"k", b"bb").unwrap();
@@ -553,8 +662,8 @@ mod tests {
 
     #[test]
     fn empty_value_roundtrips() {
-        let path = TempFile(temp_path("empty"));
-        let cache = ShmCache::open(&path.0, 64).unwrap();
+        let shm = TempShm::new();
+        let cache = shm.open(64);
 
         cache.write(b"k", b"").unwrap();
         assert_eq!(cache.read(b"k"), Some(Bytes::new()));
@@ -562,8 +671,8 @@ mod tests {
 
     #[test]
     fn rejects_oversized_key_and_value() {
-        let path = TempFile(temp_path("oversize"));
-        let cache = ShmCache::open(&path.0, 64).unwrap();
+        let shm = TempShm::new();
+        let cache = shm.open(64);
 
         let big_key = vec![b'k'; MAX_KEY_LEN + 1];
         let big_val = vec![b'v'; MAX_VAL_LEN + 1];
@@ -579,8 +688,8 @@ mod tests {
 
     #[test]
     fn max_sized_key_and_value_roundtrip() {
-        let path = TempFile(temp_path("maxsize"));
-        let cache = ShmCache::open(&path.0, 64).unwrap();
+        let shm = TempShm::new();
+        let cache = shm.open(64);
 
         let key = vec![b'k'; MAX_KEY_LEN];
         let val = vec![b'v'; MAX_VAL_LEN];
@@ -592,11 +701,11 @@ mod tests {
     fn second_handle_sees_the_same_data() {
         // Same-process stand-in for the cross-process test: a second mapping of the
         // same file must observe the first handle's writes.
-        let path = TempFile(temp_path("shared"));
-        let a = ShmCache::open(&path.0, 64).unwrap();
+        let shm = TempShm::new();
+        let a = shm.open(64);
         a.write(b"shared", b"value").unwrap();
 
-        let b = ShmCache::open(&path.0, 64).unwrap();
+        let b = shm.open(64);
         assert_eq!(b.read(b"shared"), Some(Bytes::from_static(b"value")));
 
         b.write(b"shared", b"updated").unwrap();
@@ -608,13 +717,13 @@ mod tests {
         // Opening with a different slot count must not re-modulus the existing cache:
         // the two handles would hash the same key to different slots and silently stop
         // sharing, which looks like a cache that just never hits.
-        let path = TempFile(temp_path("mismatch"));
+        let shm = TempShm::new();
 
-        let creator = ShmCache::open(&path.0, 256).unwrap();
+        let creator = shm.open(256);
         creator.write(b"k", b"v").unwrap();
 
         for requested in [1, 64, 4096] {
-            let joiner = ShmCache::open(&path.0, requested).unwrap();
+            let joiner = shm.open(requested);
             assert_eq!(
                 joiner.capacity(),
                 256,
@@ -628,35 +737,108 @@ mod tests {
     }
 
     #[test]
-    fn reopening_smaller_does_not_truncate() {
-        // `set_len` shrinks, so a careless open would cut the file down and take live
-        // slots with it.
-        let path = TempFile(temp_path("truncate"));
+    fn joining_smaller_keeps_every_slot_reachable() {
+        // A joiner never resizes the object, so the risk is not truncation but that it
+        // adopts its own smaller modulus and can no longer address the upper slots.
+        let shm = TempShm::new();
 
-        let big = ShmCache::open(&path.0, 2048).unwrap();
-        // A key that lands in a high slot, which a truncated file would not contain.
-        let key = b"tail-key";
-        big.write(key, b"v").unwrap();
-        let len_before = std::fs::metadata(&path.0).unwrap().len();
-
-        let small = ShmCache::open(&path.0, 8).unwrap();
-        assert_eq!(small.capacity(), 2048);
-        assert_eq!(
-            std::fs::metadata(&path.0).unwrap().len(),
-            len_before,
-            "file must not shrink"
+        let big = shm.open(2048);
+        let high_slot_keys: Vec<Vec<u8>> = (0..64u64)
+            .map(|i| format!("key-{i}").into_bytes())
+            .filter(|k| big.slot_index(k) >= 8)
+            .collect();
+        assert!(
+            !high_slot_keys.is_empty(),
+            "test needs keys beyond the joiner's requested slot count"
         );
-        assert_eq!(small.read(key), Some(Bytes::from_static(b"v")));
+        for k in &high_slot_keys {
+            big.write(k, b"v").unwrap();
+        }
+
+        let small = shm.open(8);
+        assert_eq!(small.capacity(), 2048);
+        for k in &high_slot_keys {
+            assert_eq!(
+                small.read(k),
+                Some(Bytes::from_static(b"v")),
+                "key in slot {} unreachable from the joiner",
+                big.slot_index(k)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unusable_app_names() {
+        let too_long = "x".repeat(MAX_APP_NAME_LEN + 1);
+        for (name, why) in [
+            ("", "empty"),
+            (too_long.as_str(), "longer than macOS accepts"),
+            ("has/slash", "a slash makes it a different POSIX object"),
+            ("has space", "space"),
+            ("emoji\u{1f600}", "non-ascii"),
+        ] {
+            assert!(
+                matches!(
+                    ShmCache::open(name, 8),
+                    Err(Error::InvalidAppName { .. })
+                ),
+                "{why:?} should be rejected: {name:?}"
+            );
+        }
+
+        // The maximum length itself must be accepted, not off by one.
+        let at_limit = "a".repeat(MAX_APP_NAME_LEN);
+        let cache = ShmCache::open(&at_limit, 8);
+        assert!(cache.is_ok(), "a name of exactly the limit should work");
+        drop(cache);
+        ShmCache::unlink(&at_limit).unwrap();
+    }
+
+    #[test]
+    fn unlink_starts_the_next_open_fresh() {
+        let shm = TempShm::new();
+        {
+            let cache = shm.open(64);
+            cache.write(b"k", b"v").unwrap();
+            assert_eq!(cache.read(b"k"), Some(Bytes::from_static(b"v")));
+        }
+
+        ShmCache::unlink(&shm.0).unwrap();
+
+        let cache = shm.open(64);
+        assert_eq!(cache.read(b"k"), None, "unlink should discard the contents");
+
+        // Unlinking something already gone is not an error.
+        ShmCache::unlink(&shm.0).unwrap();
+        ShmCache::unlink(&shm.0).unwrap();
+    }
+
+    #[test]
+    fn nothing_is_written_to_disk() {
+        // Guards against regressing to a path-backed mapping, which would put the cache
+        // on durable storage and expose it to writeback and page-fault stalls.
+        let shm = TempShm::new();
+        let cache = shm.open(64);
+        cache.write(b"k", b"v").unwrap();
+
+        for dir in [std::env::temp_dir(), std::env::current_dir().unwrap()] {
+            let stray = dir.join(&shm.0);
+            assert!(
+                !stray.exists(),
+                "cache should not appear on disk, found {}",
+                stray.display()
+            );
+        }
     }
 
     #[test]
     fn data_survives_reopen() {
-        let path = TempFile(temp_path("persist"));
+        let shm = TempShm::new();
         {
-            let cache = ShmCache::open(&path.0, 64).unwrap();
+            let cache = shm.open(64);
             cache.write(b"k", b"v").unwrap();
         }
-        let cache = ShmCache::open(&path.0, 64).unwrap();
+        let cache = shm.open(64);
         assert_eq!(cache.read(b"k"), Some(Bytes::from_static(b"v")));
     }
 
@@ -664,8 +846,8 @@ mod tests {
     fn colliding_key_reads_as_a_miss() {
         // One slot, so every key collides. The occupant must not be returned for a
         // different key.
-        let path = TempFile(temp_path("collide"));
-        let cache = ShmCache::open(&path.0, 1).unwrap();
+        let shm = TempShm::new();
+        let cache = shm.open(1);
 
         cache.write(b"first", b"one").unwrap();
         assert_eq!(cache.read(b"second"), None);
@@ -681,8 +863,8 @@ mod tests {
         // self-checking, so a torn read fails the checksum rather than going unnoticed.
         use std::sync::Arc;
 
-        let path = TempFile(temp_path("threads"));
-        let cache = Arc::new(ShmCache::open(&path.0, 16).unwrap());
+        let shm = TempShm::new();
+        let cache = Arc::new(shm.open(16));
         let writer_cache = Arc::clone(&cache);
 
         let writer = std::thread::spawn(move || {

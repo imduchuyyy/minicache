@@ -1,4 +1,4 @@
-//! Two separate OS processes hammering the same key in one mapped file.
+//! Two separate OS processes hammering the same key in one shared-memory cache.
 //!
 //! Threads would not prove anything here — they share an address space, so a
 //! thread-based test passes even if the design accidentally depends on process-local
@@ -8,7 +8,7 @@
 //! Every value is self-checking (see `minicache::selftest`), so a torn read
 //! fails its checksum instead of slipping through as a plausible-looking byte string.
 
-use std::path::PathBuf;
+use minicache::ShmCache;
 use std::process::{Child, Command};
 
 /// Cargo exports this for every `[[bin]]`, so the test always runs the binary from
@@ -17,37 +17,32 @@ const WORKER: &str = env!("CARGO_BIN_EXE_shm_worker");
 
 const ITERATIONS: u64 = 200_000;
 
-/// Removes the backing file when the test ends, including on panic.
-struct TempShm(PathBuf);
+/// A shared-memory object outlives every process that used it, so each test needs a
+/// name nothing else will pick and must unlink it afterwards or it survives until
+/// reboot. Unlinking also runs up front, in case an earlier crashed run left one behind.
+struct TempShm(String);
 
 impl TempShm {
     fn new(tag: &str) -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        TempShm(
-            std::env::temp_dir().join(format!(
-                "minicache-ipc-{tag}-{}-{nanos}.shm",
-                std::process::id()
-            )),
-        )
+        let name = format!("mc-i{tag}-{:x}", std::process::id());
+        let _ = ShmCache::unlink(&name);
+        TempShm(name)
     }
 
-    fn path(&self) -> &str {
-        self.0.to_str().unwrap()
+    fn name(&self) -> &str {
+        &self.0
     }
 }
 
 impl Drop for TempShm {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = ShmCache::unlink(&self.0);
     }
 }
 
-fn spawn(path: &str, role: &str, iterations: u64) -> Child {
+fn spawn(name: &str, role: &str, iterations: u64) -> Child {
     Command::new(WORKER)
-        .arg(path)
+        .arg(name)
         .arg(role)
         .arg(iterations.to_string())
         .spawn()
@@ -60,8 +55,8 @@ fn two_processes_share_one_key_without_torn_reads() {
 
     // Reader first, so it is already polling when the writer's first value lands.
     // It tolerates the key being absent, so losing the race is harmless.
-    let mut reader = spawn(shm.path(), "reader", ITERATIONS);
-    let mut writer = spawn(shm.path(), "writer", ITERATIONS);
+    let mut reader = spawn(shm.name(), "reader", ITERATIONS);
+    let mut writer = spawn(shm.name(), "writer", ITERATIONS);
 
     let writer_status = writer.wait().expect("writer never exited");
     let reader_status = reader.wait().expect("reader never exited");
@@ -81,10 +76,10 @@ fn two_processes_share_one_key_without_torn_reads() {
 #[test]
 fn reader_starting_late_still_sees_the_final_value() {
     // The writer finishes before the reader is even spawned, so the only way the
-    // value can be found is through the file itself.
+    // value can be found is through the shared-memory object itself.
     let shm = TempShm::new("late");
 
-    let writer_status = spawn(shm.path(), "writer", 1_000)
+    let writer_status = spawn(shm.name(), "writer", 1_000)
         .wait()
         .expect("writer never exited");
     assert!(
@@ -92,7 +87,7 @@ fn reader_starting_late_still_sees_the_final_value() {
         "writer process failed: {writer_status}"
     );
 
-    let reader_status = spawn(shm.path(), "reader", 1_000)
+    let reader_status = spawn(shm.name(), "reader", 1_000)
         .wait()
         .expect("reader never exited");
     assert!(
@@ -103,7 +98,7 @@ fn reader_starting_late_still_sees_the_final_value() {
 
 #[test]
 fn concurrent_writers_race_to_create_and_contend() {
-    // Two things at once. All three processes race to initialise a file that does not
+    // Two things at once. All three processes race to initialise a cache that does not
     // exist yet: exactly one should win the header compare-exchange, and the losers
     // must wait rather than reinitialising and wiping the winner's slots.
     //
@@ -113,7 +108,7 @@ fn concurrent_writers_race_to_create_and_contend() {
     let shm = TempShm::new("race");
 
     let mut workers: Vec<Child> = (0..3)
-        .map(|_| spawn(shm.path(), "writer", 5_000))
+        .map(|_| spawn(shm.name(), "writer", 5_000))
         .collect();
 
     for (i, w) in workers.iter_mut().enumerate() {
@@ -123,7 +118,7 @@ fn concurrent_writers_race_to_create_and_contend() {
 
     // Both wrote the same key, so whichever finished last wins — but the value must
     // be intact and readable by a third process.
-    let reader_status = spawn(shm.path(), "reader", 5_000)
+    let reader_status = spawn(shm.name(), "reader", 5_000)
         .wait()
         .expect("reader never exited");
     assert!(

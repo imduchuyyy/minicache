@@ -5,31 +5,25 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use minicache::ShmCache;
-use std::path::PathBuf;
 
 const SLOTS: usize = 4096;
 
-/// Removes the backing file when the bench ends.
-struct TempShm(PathBuf, ShmCache);
+/// Unlinks the shared-memory object when the bench ends, since it would otherwise
+/// survive until reboot.
+struct TempShm(String, ShmCache);
 
 impl TempShm {
     fn new(tag: &str) -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "minicache-bench-{tag}-{}-{nanos}.shm",
-            std::process::id()
-        ));
-        let cache = ShmCache::open(&path, SLOTS).unwrap();
-        TempShm(path, cache)
+        let name = format!("mc-b{tag}-{:x}", std::process::id());
+        let _ = ShmCache::unlink(&name);
+        let cache = ShmCache::open(&name, SLOTS).unwrap();
+        TempShm(name, cache)
     }
 }
 
 impl Drop for TempShm {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = ShmCache::unlink(&self.0);
     }
 }
 

@@ -1,10 +1,10 @@
 //! Test helper for `tests/shm_ipc.rs`.
 //!
-//! Two of these run as separate OS processes against the same mapped file, one
+//! Two of these run as separate OS processes against the same shared-memory object, one
 //! writing and one reading the same key. Kept as a real binary rather than threads
 //! because threads share an address space, which is exactly the thing being tested.
 //!
-//! Usage: `shm_worker <path> <writer|reader> <iterations>`
+//! Usage: `shm_worker <app-name> <writer|reader> <iterations>`
 //!
 //! Exits non-zero on any violated assertion so failures surface through `cargo test`.
 
@@ -20,11 +20,11 @@ const READER_TIMEOUT: Duration = Duration::from_secs(30);
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 4 {
-        eprintln!("usage: {} <path> <writer|reader> <iterations>", args[0]);
+        eprintln!("usage: {} <app-name> <writer|reader> <iterations>", args[0]);
         return ExitCode::FAILURE;
     }
 
-    let path = &args[1];
+    let app_name = &args[1];
     let role = args[2].as_str();
     let iterations: u64 = match args[3].parse() {
         Ok(n) => n,
@@ -34,10 +34,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let cache = match ShmCache::open(path, NUM_SLOTS) {
+    let cache = match ShmCache::open(app_name, NUM_SLOTS) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[{role}] could not open {path}: {e}");
+            eprintln!("[{role}] could not open {app_name}: {e}");
             return ExitCode::FAILURE;
         }
     };
