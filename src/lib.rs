@@ -183,9 +183,11 @@ unsafe impl Sync for ShmCache {}
 impl ShmCache {
     /// Open the cache at `path`, creating and initialising it if it does not exist.
     ///
-    /// `num_slots` is only honoured by whichever process creates the file; an existing
-    /// file keeps the slot count it was created with, and the caller's value is ignored
-    /// rather than silently reinterpreting someone else's data.
+    /// `num_slots` is only honoured by whichever process creates the file. An existing
+    /// cache keeps the slot count it was created with, and the caller's value is
+    /// ignored — reinterpreting someone else's slots at a different modulus would mean
+    /// the two processes hash the same key to different places and silently stop
+    /// sharing. Use [`ShmCache::capacity`] to see what you actually got.
     pub fn open<P: AsRef<Path>>(path: P, num_slots: usize) -> Result<Self, Error> {
         assert!(num_slots > 0, "num_slots must be > 0");
         assert!(
@@ -193,7 +195,6 @@ impl ShmCache {
             "num_slots must fit in a u32"
         );
 
-        let len = size_of::<Header>() + num_slots * size_of::<Slot>();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -201,25 +202,50 @@ impl ShmCache {
             .truncate(false)
             .open(path)?;
 
-        // A fresh file is zero length; a file another process already sized is left
-        // alone so we never truncate live data out from under it.
-        if file.metadata()?.len() < len as u64 {
-            file.set_len(len as u64)?;
+        // Only ever grow. `set_len` to a smaller size would truncate a cache another
+        // process is actively using.
+        if file.metadata()?.len() < Self::file_len(num_slots) as u64 {
+            file.set_len(Self::file_len(num_slots) as u64)?;
         }
 
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        let cache = ShmCache { mmap, num_slots };
-        cache.init_header(num_slots)?;
-        Ok(cache)
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        if mmap.len() < size_of::<Header>() {
+            return Err(Error::BadFormat);
+        }
+
+        let effective = Self::init_header(&mmap, num_slots)?;
+
+        // The creator may have asked for more slots than we sized the file for, and two
+        // processes racing to create can interleave their `set_len` calls such that the
+        // file ends up shorter than the winning header claims. Either way the header is
+        // authoritative, so the mapping has to be made to cover it.
+        let required = Self::file_len(effective);
+        if mmap.len() < required {
+            file.set_len(required as u64)?;
+            mmap = unsafe { MmapMut::map_mut(&file)? };
+            if mmap.len() < required {
+                return Err(Error::BadFormat);
+            }
+        }
+
+        Ok(ShmCache {
+            mmap,
+            num_slots: effective,
+        })
     }
 
-    /// Claim the header, or wait for whoever claimed it first.
+    fn file_len(num_slots: usize) -> usize {
+        size_of::<Header>() + num_slots * size_of::<Slot>()
+    }
+
+    /// Claim the header, or wait for whoever claimed it first, and report the slot
+    /// count that actually applies.
     ///
     /// A new file is zero-filled, so `magic == 0` marks it uninitialised. Exactly one
-    /// process wins the compare-exchange and fills the header in; everyone else spins
-    /// until `ready` is published.
-    fn init_header(&self, num_slots: usize) -> Result<(), Error> {
-        let header = self.header();
+    /// process wins the compare-exchange and fills the header in; everyone else waits
+    /// for `ready` and then adopts the winner's slot count rather than its own.
+    fn init_header(mmap: &MmapMut, num_slots: usize) -> Result<usize, Error> {
+        let header = unsafe { &*(mmap.as_ptr() as *const Header) };
 
         match header
             .magic
@@ -230,7 +256,7 @@ impl ShmCache {
                 header.version.store(FORMAT_VERSION, Ordering::Relaxed);
                 header.num_slots.store(num_slots as u32, Ordering::Relaxed);
                 header.ready.store(1, Ordering::Release);
-                Ok(())
+                Ok(num_slots)
             }
             Err(MAGIC) => {
                 // The winner only has three relaxed stores to do, but it can still be
@@ -242,7 +268,11 @@ impl ShmCache {
                         if header.version.load(Ordering::Relaxed) != FORMAT_VERSION {
                             return Err(Error::BadFormat);
                         }
-                        return Ok(());
+                        let existing = header.num_slots.load(Ordering::Relaxed) as usize;
+                        if existing == 0 {
+                            return Err(Error::BadFormat);
+                        }
+                        return Ok(existing);
                     }
                     if !backoff.wait(WRITE_LOCK_TIMEOUT) {
                         return Err(Error::BadFormat);
@@ -253,15 +283,10 @@ impl ShmCache {
         }
     }
 
-    /// Number of slots this cache was created with.
+    /// Number of slots this cache actually has, which is the count the creating
+    /// process chose — not necessarily the one passed to [`ShmCache::open`].
     pub fn capacity(&self) -> usize {
         self.num_slots
-    }
-
-    fn header(&self) -> &Header {
-        // The mapping is at least `size_of::<Header>()` bytes and mmap returns
-        // page-aligned memory, which satisfies Header's 64-byte alignment.
-        unsafe { &*(self.mmap.as_ptr() as *const Header) }
     }
 
     fn slot(&self, index: usize) -> &Slot {
@@ -576,6 +601,52 @@ mod tests {
 
         b.write(b"shared", b"updated").unwrap();
         assert_eq!(a.read(b"shared"), Some(Bytes::from_static(b"updated")));
+    }
+
+    #[test]
+    fn existing_slot_count_wins_over_the_callers() {
+        // Opening with a different slot count must not re-modulus the existing cache:
+        // the two handles would hash the same key to different slots and silently stop
+        // sharing, which looks like a cache that just never hits.
+        let path = TempFile(temp_path("mismatch"));
+
+        let creator = ShmCache::open(&path.0, 256).unwrap();
+        creator.write(b"k", b"v").unwrap();
+
+        for requested in [1, 64, 4096] {
+            let joiner = ShmCache::open(&path.0, requested).unwrap();
+            assert_eq!(
+                joiner.capacity(),
+                256,
+                "opening with {requested} slots should adopt the creator's 256"
+            );
+            assert_eq!(joiner.read(b"k"), Some(Bytes::from_static(b"v")));
+
+            joiner.write(b"k2", b"v2").unwrap();
+            assert_eq!(creator.read(b"k2"), Some(Bytes::from_static(b"v2")));
+        }
+    }
+
+    #[test]
+    fn reopening_smaller_does_not_truncate() {
+        // `set_len` shrinks, so a careless open would cut the file down and take live
+        // slots with it.
+        let path = TempFile(temp_path("truncate"));
+
+        let big = ShmCache::open(&path.0, 2048).unwrap();
+        // A key that lands in a high slot, which a truncated file would not contain.
+        let key = b"tail-key";
+        big.write(key, b"v").unwrap();
+        let len_before = std::fs::metadata(&path.0).unwrap().len();
+
+        let small = ShmCache::open(&path.0, 8).unwrap();
+        assert_eq!(small.capacity(), 2048);
+        assert_eq!(
+            std::fs::metadata(&path.0).unwrap().len(),
+            len_before,
+            "file must not shrink"
+        );
+        assert_eq!(small.read(key), Some(Bytes::from_static(b"v")));
     }
 
     #[test]
