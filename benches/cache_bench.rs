@@ -1,15 +1,8 @@
-//! Raw throughput of the shared-memory cache, excluding any IPC coordination.
-//!
-//! These run single-threaded against an uncontended mapping, so they measure the cost
-//! of the hash, the seqlock, and the copy — not the cost of contention.
-
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use minicache::ShmCache;
 
 const SLOTS: usize = 4096;
 
-/// Unlinks the shared-memory object when the bench ends, since it would otherwise
-/// survive until reboot.
 struct TempShm(String, ShmCache);
 
 impl TempShm {
@@ -46,10 +39,6 @@ fn bench_read_hit(c: &mut Criterion) {
     });
 }
 
-/// Read hits across value sizes.
-///
-/// If the cost tracked value size, this would scale with the memcpy. If it is roughly
-/// flat, the allocation inside `Bytes::copy_from_slice` dominates instead.
 fn bench_read_by_value_size(c: &mut Criterion) {
     let mut group = c.benchmark_group("shm_read_hit_by_size");
     for size in [8usize, 256, 1024] {
@@ -70,8 +59,6 @@ fn bench_read_miss(c: &mut Criterion) {
     });
 }
 
-/// Reads across many distinct keys, so the working set no longer fits in cache and the
-/// benchmark reflects real memory traffic rather than one hot slot.
 fn bench_read_spread(c: &mut Criterion) {
     let shm = TempShm::new("read-spread");
     let val = vec![b'v'; 256];

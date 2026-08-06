@@ -1,13 +1,3 @@
-//! Test helper for `tests/shm_ipc.rs`.
-//!
-//! Two of these run as separate OS processes against the same shared-memory object, one
-//! writing and one reading the same key. Kept as a real binary rather than threads
-//! because threads share an address space, which is exactly the thing being tested.
-//!
-//! Usage: `shm_worker <app-name> <writer|reader> <iterations>`
-//!
-//! Exits non-zero on any violated assertion so failures surface through `cargo test`.
-
 use minicache::ShmCache;
 use minicache::selftest::{check_value, make_value};
 use std::process::ExitCode;
@@ -71,12 +61,6 @@ fn reader(cache: &ShmCache, iterations: u64) -> ExitCode {
     let mut distinct = std::collections::HashSet::new();
     let mut highest = 0u64;
 
-    // The writer runs flat out, so most values are missed. That is fine: what is
-    // being tested is that no value is ever observed half-written, and that the
-    // writer's final value crosses the process boundary.
-    //
-    // The clock is only checked periodically — reading it every pass would dominate
-    // the loop and starve the reader of samples.
     let mut spins = 0u32;
     loop {
         spins += 1;

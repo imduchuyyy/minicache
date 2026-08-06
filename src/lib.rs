@@ -1,5 +1,3 @@
-// The README's examples are compiled and run as doctests, so they cannot drift out of
-// sync with the API.
 #![doc = include_str!("../README.md")]
 
 #[cfg(not(unix))]
@@ -15,43 +13,20 @@ use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::time::{Duration, Instant};
 
-/// "MINICACH", so we refuse to map an object that is not ours.
 const MAGIC: u64 = 0x4d49_4e49_4341_4348;
 const FORMAT_VERSION: u32 = 1;
 
-/// Longest app name accepted.
-///
-/// macOS caps a POSIX shared-memory name at 31 bytes including the leading slash, and
-/// silently rejects anything longer. Linux allows far more, but the limit is applied
-/// uniformly so a name that works on one platform works on the other.
 pub const MAX_APP_NAME_LEN: usize = 30;
 
-/// Largest key we will store. Keys are inline in the slot, not indirected.
 pub const MAX_KEY_LEN: usize = 64;
-/// Largest value we will store. Sized for the sub-1KB values this cache targets.
 pub const MAX_VAL_LEN: usize = 1024;
 
-/// Busy-spin attempts before falling back to yielding. Covers the common case where
-/// the slot holder is running on another core and will release within nanoseconds.
 const SPIN_ATTEMPTS: usize = 64;
 
-/// How long a writer waits for a contended slot before declaring the holder dead.
-///
-/// This must be a wall-clock bound, not an iteration count. A live writer can be
-/// preempted mid-write for milliseconds, and an iteration count cannot distinguish
-/// that from a writer that died — which would make ordinary multi-writer contention
-/// fail writes at random.
 const WRITE_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// How long a reader waits before treating a locked slot as a miss. Shorter than the
-/// writer's bound because a reader has the option of giving up: a spurious miss is
-/// valid cache behaviour, whereas a spurious write failure loses data.
 const READ_LOCK_TIMEOUT: Duration = Duration::from_millis(5);
 
-/// Spins for `SPIN_ATTEMPTS`, then yields, and reports whether `timeout` has elapsed.
-///
-/// The clock is only consulted once the spin phase is exhausted, so an uncontended
-/// slot never pays for a `Instant::now()` call.
 struct Backoff {
     attempts: usize,
     deadline: Option<Instant>,
@@ -65,19 +40,18 @@ impl Backoff {
         }
     }
 
-    /// Returns `false` once `timeout` has elapsed, meaning the holder is presumed dead.
     fn wait(&mut self, timeout: Duration) -> bool {
         self.attempts += 1;
         if self.attempts <= SPIN_ATTEMPTS {
             hint::spin_loop();
             return true;
         }
-        let deadline = *self.deadline.get_or_insert_with(|| Instant::now() + timeout);
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + timeout);
         if Instant::now() >= deadline {
             return false;
         }
-        // Hand the core over: the holder may be a descheduled process on this CPU,
-        // in which case spinning actively prevents it from making progress.
         std::thread::yield_now();
         true
     }
@@ -88,13 +62,8 @@ pub enum Error {
     Io(io::Error),
     KeyTooLong { len: usize },
     ValueTooLong { len: usize },
-    /// The object exists but was not written by this format/version.
     BadFormat,
-    /// The app name is empty, too long, or contains something other than an
-    /// alphanumeric, `-`, `_`, or `.`.
     InvalidAppName { reason: &'static str },
-    /// A slot stayed write-locked for `WRITE_LOCK_TIMEOUT`, which in practice means
-    /// the process that locked it died before unlocking.
     SlotStalled,
 }
 
@@ -123,21 +92,15 @@ impl From<io::Error> for Error {
     }
 }
 
-/// Written once by whichever process wins the initialisation race.
 #[repr(C, align(64))]
 struct Header {
     magic: AtomicU64,
     version: AtomicU32,
     num_slots: AtomicU32,
-    /// Published last, so a process that sees `ready == 1` sees a complete header.
     ready: AtomicU32,
     _pad: [u8; 44],
 }
 
-/// `seq` even means stable, odd means a writer holds the slot.
-///
-/// A zeroed slot is naturally valid: `seq == 0` (even, unlocked) and `key_len == 0`,
-/// which matches no key, so a freshly created object reads as empty.
 #[repr(C, align(64))]
 struct Slot {
     seq: AtomicU64,
@@ -147,71 +110,15 @@ struct Slot {
     val: [u8; MAX_VAL_LEN],
 }
 
-/// A cache that lives in POSIX shared memory, so several processes on the same host
-/// share one cache with no server and no network hop.
-///
-/// A handle is obtained with [`ShmCache::open`]; any process opening the same name
-/// attaches to the same cache, and whichever gets there first creates it.
-///
-/// # Layout
-///
-/// Everything inside the mapping is `#[repr(C)]` with a fixed layout. Nothing in there
-/// may be a pointer: each process maps the object at a different address, so a pointer
-/// written by one process is meaningless to another. This is why the cache cannot be
-/// built on `HashMap`/`Vec`, whose contents are process-local heap.
-///
-/// ```text
-/// ┌──────────────────────────────────────┐
-/// │ Header   (one cacheline)             │
-/// │   magic, version, num_slots, ready   │
-/// ├──────────────────────────────────────┤
-/// │ Slots    [Slot; num_slots]           │
-/// │   seq, key_len, val_len, key, val    │
-/// └──────────────────────────────────────┘
-/// ```
-///
-/// Slots are direct-mapped by hash. A collision overwrites, which is ordinary cache
-/// behaviour, so there is no LRU ordering — maintaining one across processes needs
-/// shared locking, which is exactly what this design avoids.
-///
-/// # Concurrency
-///
-/// Each slot is a seqlock. A writer bumps `seq` to odd, writes, then stores it even
-/// again; a reader samples `seq`, copies the value out, and re-reads `seq`, retrying if
-/// it moved. The copy is what makes the re-read meaningful — see [`ShmCache::read`].
-///
-/// There are no process-shared mutexes, so a process dying mid-write cannot poison or
-/// deadlock the cache. It leaves one slot with an odd `seq`, which both sides wait on
-/// for a bounded time, so that slot degrades to a miss rather than wedging a caller
-/// forever. Readers never write to shared memory at all, so a crashed reader cannot
-/// damage anything.
 pub struct ShmCache {
     mmap: MmapMut,
     num_slots: usize,
 }
 
-// The mapping is shared across processes and every access goes through the slot
-// seqlock, so a shared reference is enough to write.
 unsafe impl Send for ShmCache {}
 unsafe impl Sync for ShmCache {}
 
 impl ShmCache {
-    /// Open the cache named `app_name`, creating it if it does not exist.
-    ///
-    /// Every process that passes the same name shares one cache. The name is not a
-    /// filesystem path: it identifies a POSIX shared-memory object, which lives in RAM
-    /// and never reaches disk. On Linux that surfaces as a file under `/dev/shm`, which
-    /// is tmpfs; on macOS it has no filesystem presence at all. Either way the cache
-    /// disappears on reboot, and nothing is ever written to durable storage.
-    ///
-    /// The name must be at most [`MAX_APP_NAME_LEN`] bytes of alphanumerics, `-`, `_`,
-    /// or `.` — the limit and the character set are what macOS accepts.
-    ///
-    /// `num_slots` is only honoured by whichever process creates the cache. An existing
-    /// cache keeps the slot count it was created with, and the caller's value is
-    /// ignored — reinterpreting someone else's slots at a different modulus would mean
-    /// the two processes hash the same key to different places and silently stop
-    /// sharing. Use [`ShmCache::capacity`] to see what you actually got.
     pub fn open(app_name: &str, num_slots: usize) -> Result<Self, Error> {
         assert!(num_slots > 0, "num_slots must be > 0");
         assert!(
@@ -223,13 +130,8 @@ impl ShmCache {
         let (object, created) = open_shm_object(&name)?;
 
         if created {
-            // macOS permits exactly one ftruncate on a shared-memory object, and only
-            // before it is mapped, so this is the single chance to size it. Winning the
-            // O_EXCL create is what guarantees no other process has mapped it yet.
             object.set_len(Self::file_len(num_slots) as u64)?;
         } else {
-            // The creator may not have sized the object yet. It is visible from
-            // `shm_open` the moment it is created, so a joiner can arrive first.
             let mut backoff = Backoff::new();
             while (object.metadata()?.len() as usize) < size_of::<Header>() {
                 if !backoff.wait(WRITE_LOCK_TIMEOUT) {
@@ -245,8 +147,6 @@ impl ShmCache {
 
         let effective = Self::init_header(&mmap, num_slots)?;
 
-        // The object cannot be resized now, so a header claiming more slots than the
-        // mapping covers means the creator sized it inconsistently.
         if mmap.len() < Self::file_len(effective) {
             return Err(Error::BadFormat);
         }
@@ -257,13 +157,6 @@ impl ShmCache {
         })
     }
 
-    /// Destroy the named cache, so the next [`ShmCache::open`] creates a fresh one.
-    ///
-    /// A POSIX shared-memory object outlives the processes using it and is only
-    /// reclaimed by this call or a reboot. Existing handles keep working on the old
-    /// object until they are dropped; only the name is released immediately.
-    ///
-    /// Removing a cache that does not exist is not an error.
     pub fn unlink(app_name: &str) -> Result<(), Error> {
         let name = shm_name(app_name)?;
         if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
@@ -279,12 +172,6 @@ impl ShmCache {
         size_of::<Header>() + num_slots * size_of::<Slot>()
     }
 
-    /// Claim the header, or wait for whoever claimed it first, and report the slot
-    /// count that actually applies.
-    ///
-    /// A new file is zero-filled, so `magic == 0` marks it uninitialised. Exactly one
-    /// process wins the compare-exchange and fills the header in; everyone else waits
-    /// for `ready` and then adopts the winner's slot count rather than its own.
     fn init_header(mmap: &MmapMut, num_slots: usize) -> Result<usize, Error> {
         let header = unsafe { &*(mmap.as_ptr() as *const Header) };
 
@@ -293,16 +180,12 @@ impl ShmCache {
             .compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => {
-                // The OS already zeroed the object, so the slots need no further work.
                 header.version.store(FORMAT_VERSION, Ordering::Relaxed);
                 header.num_slots.store(num_slots as u32, Ordering::Relaxed);
                 header.ready.store(1, Ordering::Release);
                 Ok(num_slots)
             }
             Err(MAGIC) => {
-                // The winner only has three relaxed stores to do, but it can still be
-                // preempted between them, so this waits on the clock rather than on an
-                // iteration count.
                 let mut backoff = Backoff::new();
                 loop {
                     if header.ready.load(Ordering::Acquire) == 1 {
@@ -324,8 +207,6 @@ impl ShmCache {
         }
     }
 
-    /// Number of slots this cache actually has, which is the count the creating
-    /// process chose — not necessarily the one passed to [`ShmCache::open`].
     pub fn capacity(&self) -> usize {
         self.num_slots
     }
@@ -340,10 +221,6 @@ impl ShmCache {
         (fnv1a(key) as usize) % self.num_slots
     }
 
-    /// Store `value` under `key`, replacing whatever occupied the slot.
-    ///
-    /// Returns [`Error::SlotStalled`] if the slot is held by a writer that never
-    /// finished, which only happens if that process died mid-write.
     pub fn write(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         if key.len() > MAX_KEY_LEN {
             return Err(Error::KeyTooLong { len: key.len() });
@@ -354,8 +231,6 @@ impl ShmCache {
 
         let slot = self.slot(self.slot_index(key));
 
-        // Take the slot by moving seq from even to odd. Acquire on success keeps the
-        // payload writes below from being hoisted above the lock.
         let mut backoff = Backoff::new();
         let locked = loop {
             let seq = slot.seq.load(Ordering::Relaxed);
@@ -372,8 +247,6 @@ impl ShmCache {
             }
         };
 
-        // Raw pointers throughout: another process may be reading these bytes right
-        // now, so forming a `&mut` to them would assert an exclusivity we do not have.
         let slot_mut = slot as *const Slot as *mut Slot;
         unsafe {
             (&raw mut (*slot_mut).key_len).write_volatile(key.len() as u32);
@@ -390,19 +263,10 @@ impl ShmCache {
             );
         }
 
-        // Release publishes every write above to any reader that sees this seq.
         slot.seq.store(locked + 2, Ordering::Release);
         Ok(())
     }
 
-    /// Look up `key`, copying the value out of the mapping.
-    ///
-    /// The copy is deliberate. It is what lets us re-check `seq` afterwards and know
-    /// the bytes we returned were a single consistent snapshot — handing back a slice
-    /// into the mapping would let another process rewrite it under the caller.
-    ///
-    /// Returns `None` for a miss, for a slot holding a different key (a collision),
-    /// and for a slot stuck locked by a dead writer.
     pub fn read(&self, key: &[u8]) -> Option<Bytes> {
         if key.len() > MAX_KEY_LEN {
             return None;
@@ -420,14 +284,10 @@ impl ShmCache {
                 continue;
             }
 
-            // Everything below may be reading a half-written slot, so nothing is
-            // trusted until the seq re-check at the bottom confirms otherwise.
             let slot_ptr = slot as *const Slot;
             let key_len = unsafe { (&raw const (*slot_ptr).key_len).read_volatile() } as usize;
             let val_len = unsafe { (&raw const (*slot_ptr).val_len).read_volatile() } as usize;
 
-            // A torn read can produce nonsense lengths. Bounds-check before forming
-            // any slice, or a torn read becomes an out-of-bounds read.
             if key_len > MAX_KEY_LEN || val_len > MAX_VAL_LEN {
                 if !backoff.wait(READ_LOCK_TIMEOUT) {
                     return None;
@@ -436,8 +296,6 @@ impl ShmCache {
             }
 
             if key_len != key.len() {
-                // Either a genuine miss or a tear. Only conclude "miss" if the slot
-                // was stable across the whole sample.
                 fence(Ordering::Acquire);
                 if slot.seq.load(Ordering::Acquire) == before {
                     return None;
@@ -463,10 +321,8 @@ impl ShmCache {
                 );
             }
 
-            // Keep the copies above from sinking below the re-read.
             fence(Ordering::Acquire);
             if slot.seq.load(Ordering::Acquire) != before {
-                // Overwritten mid-copy, so these bytes are a mix of two values.
                 if !backoff.wait(READ_LOCK_TIMEOUT) {
                     return None;
                 }
@@ -481,11 +337,6 @@ impl ShmCache {
     }
 }
 
-/// Turns an app name into a POSIX shared-memory name: a leading slash and no others.
-///
-/// The character set is deliberately narrow. A `/` anywhere but the front is rejected
-/// outright by POSIX, and anything exotic risks differing between platforms, so this
-/// only accepts what is portable.
 fn shm_name(app_name: &str) -> Result<CString, Error> {
     if app_name.is_empty() {
         return Err(Error::InvalidAppName {
@@ -511,15 +362,15 @@ fn shm_name(app_name: &str) -> Result<CString, Error> {
     })
 }
 
-/// Opens the shared-memory object, reporting whether this call created it.
-///
-/// The `O_EXCL` attempt is what makes creation unambiguous: exactly one process can win
-/// it, and only that process may size the object.
 fn open_shm_object(name: &CString) -> Result<(File, bool), Error> {
     const MODE: libc::mode_t = 0o600;
 
     let created = unsafe {
-        libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, MODE as libc::c_uint)
+        libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            MODE as libc::c_uint,
+        )
     };
     if created >= 0 {
         return Ok((unsafe { File::from_raw_fd(created) }, true));
@@ -537,11 +388,6 @@ fn open_shm_object(name: &CString) -> Result<(File, bool), Error> {
     Ok((unsafe { File::from_raw_fd(joined) }, false))
 }
 
-/// FNV-1a.
-///
-/// This must be deterministic across processes. `RandomState` is seeded per process,
-/// so using it here would have each process hash the same key to a different slot and
-/// silently see an empty cache.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -551,16 +397,10 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Self-checking values shared by the in-process test and the two-process test
-/// helper binary (`src/bin/shm_worker.rs`). Bins cannot import a crate's test module,
-/// so this lives in the library proper rather than under `#[cfg(test)]`.
 #[doc(hidden)]
 pub mod selftest {
     use super::fnv1a;
 
-    /// Every value carries enough information to prove it was not assembled from two
-    /// different writes: a counter, a checksum over the rest, and a payload derived
-    /// from the counter. A torn read fails [`check_value`] instead of going unnoticed.
     pub const VALUE_LEN: usize = 128;
 
     pub fn make_value(counter: u64) -> Vec<u8> {
@@ -574,7 +414,6 @@ pub mod selftest {
         v
     }
 
-    /// Returns the counter if the value is intact, `None` if it is torn.
     pub fn check_value(v: &[u8]) -> Option<u64> {
         if v.len() != VALUE_LEN {
             return None;
@@ -587,7 +426,6 @@ pub mod selftest {
         Some(counter)
     }
 
-    /// Everything except the checksum field itself.
     fn digest_input(v: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(VALUE_LEN - 8);
         out.extend_from_slice(&v[0..8]);
@@ -601,10 +439,6 @@ mod tests {
     use super::selftest::{check_value, make_value};
     use super::*;
 
-    /// A shared-memory object outlives the process that made it, so every test needs a
-    /// name nothing else will pick and must unlink it afterwards or it lingers until
-    /// reboot. The pid keeps concurrent `cargo test` runs apart, and the counter keeps
-    /// tests within one run apart; both are hex to stay under `MAX_APP_NAME_LEN`.
     struct TempShm(String);
 
     impl TempShm {
@@ -650,8 +484,6 @@ mod tests {
 
     #[test]
     fn shorter_value_does_not_leave_a_tail() {
-        // val_len shrinks but the old bytes are still in the slot; the read must be
-        // bounded by val_len, not by whatever is left over.
         let shm = TempShm::new();
         let cache = shm.open(64);
 
@@ -699,8 +531,6 @@ mod tests {
 
     #[test]
     fn second_handle_sees_the_same_data() {
-        // Same-process stand-in for the cross-process test: a second mapping of the
-        // same file must observe the first handle's writes.
         let shm = TempShm::new();
         let a = shm.open(64);
         a.write(b"shared", b"value").unwrap();
@@ -714,9 +544,6 @@ mod tests {
 
     #[test]
     fn existing_slot_count_wins_over_the_callers() {
-        // Opening with a different slot count must not re-modulus the existing cache:
-        // the two handles would hash the same key to different slots and silently stop
-        // sharing, which looks like a cache that just never hits.
         let shm = TempShm::new();
 
         let creator = shm.open(256);
@@ -738,8 +565,6 @@ mod tests {
 
     #[test]
     fn joining_smaller_keeps_every_slot_reachable() {
-        // A joiner never resizes the object, so the risk is not truncation but that it
-        // adopts its own smaller modulus and can no longer address the upper slots.
         let shm = TempShm::new();
 
         let big = shm.open(2048);
@@ -778,15 +603,11 @@ mod tests {
             ("emoji\u{1f600}", "non-ascii"),
         ] {
             assert!(
-                matches!(
-                    ShmCache::open(name, 8),
-                    Err(Error::InvalidAppName { .. })
-                ),
+                matches!(ShmCache::open(name, 8), Err(Error::InvalidAppName { .. })),
                 "{why:?} should be rejected: {name:?}"
             );
         }
 
-        // The maximum length itself must be accepted, not off by one.
         let at_limit = "a".repeat(MAX_APP_NAME_LEN);
         let cache = ShmCache::open(&at_limit, 8);
         assert!(cache.is_ok(), "a name of exactly the limit should work");
@@ -808,15 +629,12 @@ mod tests {
         let cache = shm.open(64);
         assert_eq!(cache.read(b"k"), None, "unlink should discard the contents");
 
-        // Unlinking something already gone is not an error.
         ShmCache::unlink(&shm.0).unwrap();
         ShmCache::unlink(&shm.0).unwrap();
     }
 
     #[test]
     fn nothing_is_written_to_disk() {
-        // Guards against regressing to a path-backed mapping, which would put the cache
-        // on durable storage and expose it to writeback and page-fault stalls.
         let shm = TempShm::new();
         let cache = shm.open(64);
         cache.write(b"k", b"v").unwrap();
@@ -844,8 +662,6 @@ mod tests {
 
     #[test]
     fn colliding_key_reads_as_a_miss() {
-        // One slot, so every key collides. The occupant must not be returned for a
-        // different key.
         let shm = TempShm::new();
         let cache = shm.open(1);
 
@@ -859,8 +675,6 @@ mod tests {
 
     #[test]
     fn threads_never_observe_a_torn_value() {
-        // The single-process warm-up for tests/shm_ipc.rs. Every value is
-        // self-checking, so a torn read fails the checksum rather than going unnoticed.
         use std::sync::Arc;
 
         let shm = TempShm::new();
@@ -884,5 +698,4 @@ mod tests {
         writer.join().unwrap();
         assert!(seen > 0, "reader never observed the key");
     }
-
 }

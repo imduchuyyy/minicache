@@ -71,6 +71,10 @@ Read hits cost the same at 8-byte and 256-byte values (~46 ns) and only rise at 
 
 These are within noise of the same benchmarks against a disk-backed file, because a benchmark keeps every page resident in the page cache and so never actually touches the disk. Shared memory is not chosen here for throughput — it is chosen to remove periodic writeback of a cache nobody wants durable, and to remove the tail-latency cliff where the kernel evicts a page under memory pressure and a later cache *hit* has to block on disk to fault it back in. Neither of those shows up in a microbenchmark.
 
+## Architecture
+
+[ARCHITECTURE.md](ARCHITECTURE.md) documents the memory layout, the seqlock protocol and its memory ordering, the initialisation races, the failure model, and the measured performance characteristics.
+
 ## Testing
 
 ```bash

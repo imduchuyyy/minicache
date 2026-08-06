@@ -1,8 +1,3 @@
-//! Open a shared-memory cache, write one key, read it back.
-//!
-//! Run a second copy of this while the first is alive and it attaches to the same
-//! cache — the name is the only thing the two processes have to agree on.
-
 use minicache::ShmCache;
 
 const APP: &str = "minicache-demo";
@@ -18,8 +13,6 @@ fn main() -> Result<(), minicache::Error> {
         None => println!("hello -> miss"),
     }
 
-    // Without this the object survives until reboot, since it outlives every process
-    // that used it.
     ShmCache::unlink(APP)?;
     Ok(())
 }
