@@ -5,7 +5,7 @@
 //! state. These are real `fork`/`exec`ed processes that only share the mmap.
 //!
 //! The property under test is that a reader never observes a half-written value.
-//! Every value is self-checking (see `minicache::shm::selftest`), so a torn read
+//! Every value is self-checking (see `minicache::selftest`), so a torn read
 //! fails its checksum instead of slipping through as a plausible-looking byte string.
 
 use std::path::PathBuf;

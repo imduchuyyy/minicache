@@ -8,8 +8,8 @@
 //!
 //! Exits non-zero on any violated assertion so failures surface through `cargo test`.
 
-use minicache::shm::ShmCache;
-use minicache::shm::selftest::{check_value, make_value};
+use minicache::ShmCache;
+use minicache::selftest::{check_value, make_value};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
