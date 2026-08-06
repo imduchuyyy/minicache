@@ -1,3 +1,5 @@
+#![cfg(feature = "_selftest")]
+
 use minicache::ShmCache;
 use std::process::{Child, Command};
 

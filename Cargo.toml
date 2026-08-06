@@ -1,14 +1,24 @@
 [package]
 name = "minicache"
 version = "0.1.0"
-description = "An in-process cache, optionally shared between processes via mmap"
+description = "A lock-free cache in POSIX shared memory, shared across processes with no daemon"
 homepage = "https://github.com/imduchuyyy/minicache"
 repository = "https://github.com/imduchuyyy/minicache"
 readme = "README.md"
-keywords = ["cache", "lru", "shared-memory", "mmap", "ipc"]
+keywords = ["cache", "shared-memory", "mmap", "ipc", "lock-free"]
 categories = ["caching", "data-structures", "concurrency"]
-license-file = "LICENSE"
+license = "GPL-3.0-only"
 edition = "2024"
+
+[features]
+# Builds the cross-process test worker. Not on by default, so `cargo install`
+# does not put a test harness on the user's PATH.
+_selftest = []
+
+[[bin]]
+name = "shm_worker"
+path = "src/bin/shm_worker.rs"
+required-features = ["_selftest"]
 
 [dependencies]
 bytes = "1.0"

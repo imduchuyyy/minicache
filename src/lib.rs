@@ -398,6 +398,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 #[doc(hidden)]
+#[cfg(any(feature = "_selftest", test))]
 pub mod selftest {
     use super::fnv1a;
 
