@@ -1,3 +1,7 @@
+// The README's examples are compiled and run as doctests, so they cannot drift out of
+// sync with the API.
+#![doc = include_str!("../README.md")]
+
 pub mod shm;
 
 use bytes::Bytes;

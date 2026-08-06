@@ -1,19 +1,17 @@
 [package]
 name = "minicache"
 version = "0.1.0"
-description = "A minimalistic in-memory cache with async support"
-homepage = "github.com/imduchuyyy/minicache"
-respository = "github.com/imduchuyyy/minicache"
+description = "An in-process cache, optionally shared between processes via mmap"
+homepage = "https://github.com/imduchuyyy/minicache"
+repository = "https://github.com/imduchuyyy/minicache"
 readme = "README.md"
-keywords = ["cache", "in-memory", "async", "rust"]
-categories = ["asynchronous", "data-structures", "performance"]
+keywords = ["cache", "lru", "shared-memory", "mmap", "ipc"]
+categories = ["caching", "data-structures", "concurrency"]
 license-file = "LICENSE"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
 bytes = "1.0"
-axum = "0.8.7"
 memmap2 = "0.9.11"
 
 [dev-dependencies]
