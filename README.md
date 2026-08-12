@@ -9,7 +9,7 @@ You embed it in your application rather than running it. Several processes open 
 ## Overview
 The whole interface is one struct with four methods. You give it an application name and a slot count, and whichever process gets there first creates the cache.
 
-```rust
+```rust,ignore
 impl ShmCache {
     /// Open the cache named `app_name`, creating it if nobody has yet.
     pub fn open(app_name: &str, num_slots: usize) -> Result<Self, Error> {
